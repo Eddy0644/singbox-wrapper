@@ -4,7 +4,11 @@
 
 本脚本会修改 sing-box 服务中的ExecStart字段，因此 sing-box 服务每次启动时都会调用本脚本重新生成配置文件再进入sing-box。
 
-此外为了方便自建节点&手搓配置的用户，特设一机制，在配置文件的特定区域添加如下Flag `"▶️POST_Proxies_List"` `"▶️POST_Proxies_List_NoChain"`（包含双引号），脚本将会在运行时读取 `outbounds`列表并使用所有用户节点的 tags 列表替换掉上述Flag。
+此外为了方便自建节点&手搓配置的用户，特设一机制，在配置文件的特定区域添加如下Flag `"▶️POST_Proxies_List"` `"▶️POST_Proxies_List_NoChain"`（包含双引号），脚本将会在运行时读取 `outbounds`列表并使用所有用户节点的 tags 列表替换掉上述Flag。（为了能够识别出用户的所有节点，您将需要在 `outbounds` 数组中、代理节点开始前添加顶格注释 `# User Proxies` 尾部添加 `# End User Proxies`）
+
+```bash
+curl -o singbox-wrapper https://testingcf.jsdelivr.net/gh/Eddy0644/singbox-wrapper/singbox-wrapper
+```
 
 （下方的部分文字由AI生成）
 
