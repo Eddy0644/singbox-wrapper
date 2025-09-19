@@ -1,0 +1,401 @@
+#!/bin/bash
+# singbox-wrapper: A wrapper script for sing-box that automatically generates config.json
+# This script overrides the sing-box.service to regenerate configuration on each start
+# Usage: singbox-wrapper [install|run|set KEY=VALUE]
+
+
+# [Permission] This file should have rwx permission; Please choose a proper directory to put this script, as 'sed' needs to create temp files on script dir for replacing switch.
+# [Config] TUN config is below; Full main config could start from the end of this file (around line :400).
+
+
+# [Environment variables] - user modifiable
+SERVICE_NAME="sing-box.service"
+# If switch 'LAN' is on, then mixed inbound will listen on this ip
+LAN_access_bind_ip="0.0.0.0"
+# singbox parameters
+singbox_D="/var/lib/sing-box"
+singbox_C="/etc/sing-box"
+# Load external config file on disk (like from sub-store)
+MAIN_CONFIG=""
+# Process user proxies between '# User Proxies' and '# End User Proxies' markers, and replace all "▶️POST_Proxies_List" "▶️POST_Proxies_List_NoChain" mark inside the config to avoid manually put all proxies into each outbound selector.
+POST_PROCESS_User_Proxies=1
+
+
+# [Configuration zone] - dynamically replaced during runtime
+# For boolean variables, use 0 or 1.
+
+# If 1 then TUN configuration will be inserted into inbounds[].
+TUN=0
+# dns.strategy, useful when you want to temproarily skip ipv6 or vice versa.
+dnsStrategy=prefer_ipv4
+# whether mixed inbound is accessible to LAN devices, or only for localhost.
+LAN=1
+
+
+# [TUN configuration] (Maybe you should change the port here to match your main config)
+read -r -d '' TUN_CONFIG << 'EOF'
+{
+  "tag": "tun-in",
+  "type": "tun",
+  "address": ["172.18.0.1/30", "fdfe:dcba:9876::1/126"],
+  "route_address": ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1"],
+  "route_exclude_address": [
+    "192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12", "fc00::/7"
+  ],
+  "mtu": 9000,
+  "auto_route": true,
+  "strict_route": true,
+  "stack": "system",
+  "platform": {
+    "http_proxy": {
+      "enabled": true,
+      "server": "127.0.0.1",
+      "server_port": 2080
+    }
+  }
+}
+EOF
+
+
+
+
+
+# Get absolute path of this script itself
+SCRIPT_PATH="$(readlink -f "$0")"
+
+
+# Installation function
+install_wrapper() {
+    echo "Installing singbox-wrapper..."
+    # Check if sing-box.service exists
+    if ! systemctl list-unit-files | grep -q "^${SERVICE_NAME}"; then
+        echo "Error: ${SERVICE_NAME} not found. Please install sing-box first."
+        exit 1
+    fi
+
+    # Create service override directory if not exists
+    local override_dir="/etc/systemd/system/${SERVICE_NAME}.d"
+    local override_file="${override_dir}/sbwrapper.conf"
+
+    if [ ! -d "$override_dir" ]; then
+        mkdir -p "$override_dir"
+    fi
+
+    # Check if override file exists
+    if [ -f "$override_file" ]; then
+        # Check if current script path is in the file
+        if ! grep -q "$SCRIPT_PATH" "$override_file"; then
+            echo "Another wrapper is installed. Replacing with current script..."
+            # Remove existing ExecStart lines
+            sed -i '/^ExecStart=/d' "$override_file"
+            # Add empty ExecStart first, then new ExecStart
+            echo "ExecStart=" >> "$override_file"
+            echo "ExecStart=$SCRIPT_PATH run" >> "$override_file"
+        else
+            echo "singbox-wrapper is already installed."
+        fi
+    else
+        # Create new override file
+        cat > "$override_file" << EOL
+    [Unit]
+    Description=sing-box service (modified by singbox-wrapper)
+    [Service]
+    ExecStart=
+    ExecStart=$SCRIPT_PATH run
+EOL
+        echo "Created override file: $override_file"
+    fi
+
+    # Check if jq is installed
+    if ! command -v jq &> /dev/null; then
+        echo "Warning: jq is not installed. Please install jq for JSON processing."
+    fi
+
+    # Reload systemd daemon
+    systemctl daemon-reload
+    echo "Installation complete. You can now use 'systemctl restart ${SERVICE_NAME}'."
+}
+
+# Function to read current config values from this script
+read_config_value() {
+    local key="$1"
+    grep "^${key}=" "$SCRIPT_PATH" | head -1 | cut -d'=' -f2
+}
+
+# Function to update config value in this script
+update_config_value() {
+    local key="$1"
+    local value="$2"
+    sed -i "s/^${key}=.*/${key}=${value}/" "$SCRIPT_PATH"
+    echo "Updated ${key} to ${value}."
+}
+
+
+# Interactive configuration
+interactive_config() {
+    local changed=0
+
+    # Configure TUN
+    local current_tun=$(read_config_value "TUN")
+    echo -n "Enable TUN? (0=disabled, 1=enabled) [current: $current_tun]: "
+    read -r tun_input
+    if [ -n "$tun_input" ] && [ "$tun_input" != "$current_tun" ]; then
+        update_config_value "TUN" "$tun_input"
+        changed=1
+    fi
+
+    # Configure DNS strategy
+    local current_dns=$(read_config_value "dnsStrategy")
+    echo "DNS Strategy options:"
+    echo "  1) prefer_ipv4"
+    echo "  2) prefer_ipv6"
+    echo "  3) ipv4_only"
+    echo "  4) ipv6_only"
+    echo -n "Select DNS strategy [current: $current_dns]: "
+    read -r dns_input
+    case "$dns_input" in
+        1) dns_value="prefer_ipv4";;
+        2) dns_value="prefer_ipv6";;
+        3) dns_value="ipv4_only";;
+        4) dns_value="ipv6_only";;
+        *) dns_value="";;
+    esac
+    if [ -n "$dns_value" ] && [ "$dns_value" != "$current_dns" ]; then
+        update_config_value "dnsStrategy" "$dns_value"
+        changed=1
+    fi
+
+    # Configure LAN access
+    local current_lan=$(read_config_value "LAN")
+    echo -n "Enable LAN access? (0=localhost only, 1=LAN accessible) [current: $current_lan]: "
+    read -r lan_input
+    if [ -n "$lan_input" ] && [ "$lan_input" != "$current_lan" ]; then
+        update_config_value "LAN" "$lan_input"
+        changed=1
+    fi
+
+    # Check installation status
+    if [ -f "/etc/systemd/system/${SERVICE_NAME}.d/sbwrapper.conf" ] && \
+       grep -q "$SCRIPT_PATH" "/etc/systemd/system/${SERVICE_NAME}.d/sbwrapper.conf"; then
+        if [ $changed -eq 1 ]; then
+            echo "Configuration updated. Restarting ${SERVICE_NAME}..."
+            systemctl restart "$SERVICE_NAME"
+        else
+            echo "No changes made."
+        fi
+    else
+        echo "singbox-wrapper is not installed. Run '$0 install' to install."
+    fi
+}
+
+# Set configuration via command line
+set_config() {
+    local config_str="$1"
+    if [[ "$config_str" =~ ^([^=]+)=(.+)$ ]]; then
+        local key="${BASH_REMATCH[1]}"
+        local value="${BASH_REMATCH[2]}"
+
+        # Validate key
+        case "$key" in
+            TUN|LAN)
+                if [[ "$value" =~ ^[01]$ ]]; then
+                    update_config_value "$key" "$value"
+                else
+                    echo "Error: $key must be 0 or 1"
+                    exit 1
+                fi
+                ;;
+            dnsStrategy)
+                if [[ "$value" =~ ^(prefer_ipv4|prefer_ipv6|ipv4_only|ipv6_only)$ ]]; then
+                    update_config_value "$key" "$value"
+                else
+                    echo "Error: Invalid dnsStrategy value"
+                    exit 1
+                fi
+                ;;
+            *)
+                echo "Error: Unknown configuration key: $key"
+                exit 1
+                ;;
+        esac
+    else
+        echo "Error: Invalid format. Use: set KEY=VALUE"
+        exit 1
+    fi
+}
+
+
+
+
+# Generate configuration and run sing-box
+run_singbox() {
+    # Check jq availability
+    if ! command -v jq &> /dev/null; then
+        echo "Error: jq is required but not installed."
+        exit 1
+    fi
+
+    # Determine listen address based on LAN setting
+    if [ "$LAN" = "1" ]; then
+        listen_addr="$LAN_access_bind_ip"
+    else
+        listen_addr="127.0.0.1"
+    fi
+
+    # Load main config from different sources
+    config=""
+    if [ -n "$MAIN_CONFIG" ] && [ -f "$MAIN_CONFIG" ]; then
+        echo "Loading main config from: $MAIN_CONFIG"
+        config=$(cat "$MAIN_CONFIG")
+    else
+        # Start with main config (from end of file), without filtering comment lines initially
+        config=$(sed -n '/^# MAIN_CONFIG_START/,$ p' "$SCRIPT_PATH" | tail -n +2)
+
+        # If config is empty, use a minimal default
+        if [ -z "$config" ] || [ "$config" = "null" ]; then
+            read -r -d '' config << 'EOF'
+{
+  "log": {
+    "level": "info"
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "proxyDNS",
+        "server": "8.8.8.8",
+        "type": "tls",
+        "detour": "Proxy"
+      },
+      {
+        "tag": "localDNS",
+        "server": "223.5.5.5",
+        "type": "https"
+      }
+    ],
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 2080
+    }
+  ],
+  "outbounds": [],
+  "route": {}
+}
+EOF
+        fi
+    fi
+
+    # Process user proxies if enabled
+    if [ "$POST_PROCESS_User_Proxies" = "1" ]; then
+        echo "Processing user proxies..."
+
+        # Extract user proxies between markers
+        user_proxies_raw=$(echo "$config" | sed -n '/# User Proxies/,/# End User Proxies/p' | sed '1d;$d')
+
+        if [ -n "$user_proxies_raw" ]; then
+            # Remove trailing comma from the last line and ensure proper comma placement
+            user_proxies_clean=$(echo "$user_proxies_raw" | sed '$ s/,\s*$//')
+            # Add commas to all lines except the last one if they don't already have them
+            #user_proxies_clean=$(echo "$user_proxies_clean" | sed '$ ! s/[^,]$/&,/')
+            user_proxies="[$user_proxies_clean]"
+
+            # Extract all proxy tags
+            POST_Proxies_List=$(echo "$user_proxies" | jq -r '.[].tag' | sed 's/.*/"&"/' | tr '\n' ',' | sed 's/,$//')
+
+            # Extract proxy tags without detour field (no chaining)
+            POST_Proxies_List_NoChain=$(echo "$user_proxies" | jq -r '.[] | select(has("detour") | not) | .tag' | sed 's/.*/"&"/' | tr '\n' ',' | sed 's/,$//')
+
+            # Replace placeholders in config
+            if [ -n "$POST_Proxies_List" ]; then
+                config=$(echo "$config" | sed "s/\"▶️POST_Proxies_List\"/$POST_Proxies_List/g")
+                echo "Replaced ▶️POST_Proxies_List with: $POST_Proxies_List"
+            fi
+
+            if [ -n "$POST_Proxies_List_NoChain" ]; then
+                config=$(echo "$config" | sed "s/\"▶️POST_Proxies_List_NoChain\"/$POST_Proxies_List_NoChain/g")
+                echo "Replaced ▶️POST_Proxies_List_NoChain with: $POST_Proxies_List_NoChain"
+            fi
+        else
+            echo "No user proxies found between markers."
+        fi
+    fi
+
+    # Remove comment lines at the end
+    config=$(echo "$config" | grep -v '^[[:space:]]*#')
+
+    jq_filter=""
+
+    # Add TUN if enabled
+    if [ "$TUN" = "1" ]; then
+        jq_filter="${jq_filter} | .inbounds += [${TUN_CONFIG}]"
+    fi
+    # Update DNS strategy
+    jq_filter="${jq_filter} | .dns.strategy = \"${dnsStrategy}\""
+    # Update mixed inbound listen address
+    jq_filter="${jq_filter} | .inbounds |= map(if .type == \"mixed\" then .listen = \"${listen_addr}\" else . end)"
+    # Apply jq transformations
+    final_config=$(echo "$config" | jq "${jq_filter:3}")
+
+    # Write configuration file
+    echo "$final_config" > "${singbox_C}/config.json"
+    echo "Generated config.json with TUN=$TUN, dnsStrategy=$dnsStrategy, LAN=$LAN"
+
+    # Execute sing-box
+    exec /usr/bin/sing-box -D $singbox_D -C $singbox_C run
+}
+
+
+# Main script logic
+case "$1" in
+    i|install)
+        install_wrapper
+        ;;
+    run)
+        run_singbox
+        ;;
+    set)
+        shift
+        set_config "$1"
+        ;;
+    "")
+        interactive_config
+        ;;
+    *)
+        echo "Usage: $0 [install|run|set KEY=VALUE]"
+        echo "  install - Install wrapper to override sing-box.service"
+        echo "  run     - Generate config and run sing-box (used by systemd)"
+        echo "  set     - Set configuration value (e.g., set TUN=1)"
+        echo "  (none)  - Interactive configuration"
+        exit 1
+        ;;
+esac
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+exit
+# Put your config content on line 401; and do not modify line 400!
+# MAIN_CONFIG_START
+
